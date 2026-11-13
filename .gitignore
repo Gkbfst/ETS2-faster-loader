@@ -1,0 +1,26 @@
+# ---- build products ----
+*.exe
+*.dll
+*.o
+*.obj
+*.exp
+*.lib
+*.pdb
+
+# ---- runtime logs ----
+*.log
+ets2fast.log
+ets2fast-launcher.log
+
+# ---- packaging output ----
+dist/
+*.zip
+*.7z
+
+# ---- editors / OS ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+~$*
+.DS_Store
