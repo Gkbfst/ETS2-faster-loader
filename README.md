@@ -1,112 +1,115 @@
 # ets2fast
 
-**Load-time accelerator for Euro Truck Simulator 2** — cuts save loading from over a minute to under thirty seconds, without touching game files or any mod.
+**Euro Truck Simulator 2 载入加速** — 把「等读档」从 1 分钟压到 30 秒以内，不修改游戏文件，不修改任何 mod。
 
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078D6)](#)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-**English** | [简体中文](README.zh-CN.md)
+**简体中文** | [English](README.en.md)
 
 ---
 
-## Results
+## 效果
 
-Same machine, same 58 workshop mods, same load, measured with and without the tool:
+同一台机器、同样 58 个 mod、同一次载入，装与不装的实测对比：
 
-| Stage | Without | With | Delta |
+| 阶段 | 无工具 | 有工具 | 差值 |
 |---|---:|---:|---:|
-| Main menu appears | 8.42 s | 8.93 s | — |
-| Mod enumeration (58) | 25.05 s | 23.27 s | −1.8 s |
-| Mounting 58 packages | 0.33 s | 0.35 s | ≈0 |
-| Traffic / cities / prefabs | 6.86 s | 6.37 s | −0.5 s |
-| **Company cargo assignment** | **38.13 s** | **15.20 s** | **−22.9 s** |
-| Loading save → in cab | 9.11 s | 7.32 s | −1.8 s |
-| **Total: mods ready → drivable** | **60.97 s** | **29.23 s** | **−31.7 s** |
+| 主菜单出现 | 8.42 s | 8.93 s | — |
+| mod 枚举（58 个） | 25.05 s | 23.27 s | −1.8 s |
+| 挂载 58 个包 | 0.33 s | 0.35 s | ≈0 |
+| 交通 / 城市 / 预制件 | 6.86 s | 6.37 s | −0.5 s |
+| **公司货物分配** | **38.13 s** | **15.20 s** | **−22.9 s** |
+| 读存档 → 进驾驶室 | 9.11 s | 7.32 s | −1.8 s |
+| **合计：mod 就绪 → 可驾驶** | **60.97 s** | **29.23 s** | **−31.7 s** |
 
-Almost all of the gain sits in one stage: **1.8 million** "does this file exist" probes per load are answered from memory instead of entering the kernel.
+收益集中在「公司货物分配」这一段：一次载入里有 **180 万次**「查一个不存在的文件」被内存查表直接挡掉，不再进内核。
 
 ---
 
-## Why it is slow
+## 为什么慢
 
-ETS2's virtual file system has no resource index. Every asset request walks the mod layers in priority order, asking each one "do you have this file?", and stops at the first hit.
+ETS2 的虚拟文件系统没有资源索引。它的做法是：来一个资源请求，就按 mod 优先级**逐层问「你有这个文件吗」**，找到即停。
 
-A measured startup produced **4.25 million** file operations:
+实测一次启动产生 **425 万次**文件操作，其中：
 
-| Result | Count | Share |
+| 结果 | 次数 | 占比 |
 |---|---:|---:|
 | `PATH NOT FOUND` | 4,196,372 | **98.6 %** |
 | `SUCCESS` | 33,328 | 0.8 % |
 | `NAME NOT FOUND` | 19,125 | 0.4 % |
 
-Only 33 thousand of them actually found a file. 68 mods means 68 layers, and it takes 29 probes on average to hit one.
+真正找到文件的只有 3.3 万次，其余全是无用探测。68 个 mod 就是 68 层，平均试到 29 层才命中。
 
-The counter-intuitive part: **cost has nothing to do with mod size**. A 9-file tweak mod and a 32 GB graphics pack with 4444 files produce almost the same number of file events (~145 k each), because every mod layer gets asked about the same 76 k base resources.
+更反直觉的是：**开销与 mod 的体积无关**。一个只有 9 个文件的数值 mod，和一个 32 GB、4444 个文件的画质 mod，产生的文件事件几乎相同（都在 14.5 万次上下）——因为游戏对每个 mod 层都要把那 7.6 万个基础资源试一遍。
 
-What this tool does is keep a workshop path table inside the game process and answer "does not exist" in user space, without ever entering the kernel.
-
----
-
-## Install
-
-### 1. Download
-
-Grab `ets2fast-v1.0.0-win64.zip` from [Releases](../../releases) and extract it anywhere.
-
-### 2. Enable
-
-Double-click **`ets2fast.exe`**.
-
-> The menu is in Chinese. Here is what the keys do:
-
-| Key | Meaning |
-|---|---|
-| `1` | Enable auto-inject — starts the background daemon and registers it to run at logon |
-| `2` | Disable auto-inject — removes the autostart entry, stops the daemon, back to manual mode |
-| `3` | Show status and the tail of both log files |
-| `0` | Exit |
-
-Press **`1`**, then Enter. That is it — launching the game from Steam now injects automatically, and it keeps working after a reboot.
-
-### 3. Disable (optional)
-
-Open the menu again and press **`2`**. You are back to manual mode: start `inject.exe` first, then launch the game from Steam.
-
-### After moving the folder
-
-The menu detects that the autostart entry still points at the old path and says so. Press `1` once to refresh it.
+本工具的做法：在游戏进程内维护一份 workshop 路径表，路径不存在时直接在用户态返回，不交给内核。
 
 ---
 
-## How it works
+## 安装使用
 
-Pressing `1` does two things:
+### 1. 下载
 
-1. Starts `ets2fastd.exe`, a windowless background daemon
-2. Registers it under `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`
+从 [Releases](../../releases) 下载 `ets2fast-v1.0.0-win64.zip`，解压到任意位置（建议路径不带空格和中文，但要带也无妨）。
 
-The daemon polls for `eurotrucks2.exe` every 250 ms, injects `ets2fast.dll` as soon as the process appears, then goes back to waiting for the next launch.
+### 2. 开启
 
-**Why a daemon instead of wrapping Steam's launch options with `%command%`:**
+双击 **`ets2fast.exe`**，看到这个界面：
 
-| | Wrapper via launch options | Background daemon |
+```
+  ==========================================================
+     ETS2 载入加速  -  设置           ets2fast
+  ==========================================================
+  自动注入: 未开启（手动方式）
+
+  [1] 开启自动注入（后台守护 + 开机自启）
+  [2] 关闭自动注入（改回先开 inject.exe）
+  [3] 查看状态与日志
+  [0] 退出
+```
+
+按 **`1`** 再回车。完成。以后从 Steam 点「开始游戏」就会自动注入，开机后也自动生效。
+
+### 3. 关闭（可选）
+
+再双击 `ets2fast.exe`，按 **`2`** 回车，就回到手动方式：每次玩之前先双击 `inject.exe`，再从 Steam 启动游戏。
+
+### 目录被移动后
+
+菜单会提示「开机自启里记录的是旧路径」，重新按一次 `1` 即可。
+
+---
+
+## 工作方式
+
+`ets2fast.exe` 按 1 之后会做两件事：
+
+1. 在后台启动 `ets2fastd.exe`（无窗口守护进程）
+2. 把它登记到 `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`
+
+守护进程每 250 ms 检查一次 `eurotrucks2.exe` 是否存在，发现即注入 `ets2fast.dll`，然后继续等下一次启动。
+
+**为什么不用 `%command%` 包装 Steam 启动选项：**
+
+| | 包装启动选项 | 后台守护 |
 |---|---|---|
-| Rewrites Steam config | Yes (and Steam must be closed or it gets overwritten) | **No** |
-| Steam in-game overlay | May break — the game becomes a child process | **Unaffected** |
-| Launching from a desktop shortcut | Not covered | **Covered** |
-| Requires administrator | Depends on install location | **No, no UAC prompt** |
+| 需要改 Steam 配置 | 是（且要关掉 Steam 才不会被覆盖） | **否** |
+| Steam 游戏内叠加界面 | 可能失效（游戏成了子进程） | **正常** |
+| 从桌面快捷方式启动 | 不生效 | **生效** |
+| 需要管理员权限 | 视安装位置 | **否，无 UAC** |
 
-> Compatibility note: if you used the old `--launch` wrapper, `ets2fast.exe` still understands it — it forwards the call to `ets2fastd.exe` and passes the exit code back, so Steam keeps tracking the game correctly. The menu also checks for a leftover wrapper entry when you press `1` and warns you.
+> 兼容性：如果你之前用过旧版本的 `--launch` 包装方式，`ets2fast.exe` 收到 `--launch` 时会自动转交给 `ets2fastd.exe` 处理并透传退出码，不会出错。菜单按 `1` 时会检查 Steam 启动选项是否有残留并提醒。
 
 ---
 
-## Portability
+## 可移植性
 
-* **No drive letters.** The DLL takes the path of the process it was loaded into (`eurotrucks2.exe`), walks up until it finds a directory named `steamapps`, then builds `workshop\content\227300`. Any drive, any Steam library, zero configuration.
-* **No runtime dependencies.** All four binaries are fully static. They only import `KERNEL32` and the UCRT (`api-ms-win-crt-*`) that ships with Windows 10/11. No VC++ redistributable, no MinGW runtime.
-* **No administrator rights.** Autostart is written to `HKEY_CURRENT_USER` only.
+* **不依赖盘符**：DLL 从自己被加载进的那个进程（`eurotrucks2.exe`）的位置逐级上溯，找到名为 `steamapps` 的目录，再拼出 `workshop\content\227300`。游戏装在哪个盘、哪个 Steam 库都不需要配置。
+* **不依赖运行库**：四个产物全部静态链接，只依赖 `KERNEL32` 和 Win10/11 自带的 UCRT（`api-ms-win-crt-*`）。没有 VC++ 运行库或 MinGW 运行库依赖。
+* **不需要管理员**：开机自启只写 `HKEY_CURRENT_USER`。
 
-Unusual layouts can be forced with an environment variable:
+特殊布局可以用环境变量强制指定：
 
 ```cmd
 set ETS2FAST_ROOT=H:\SteamLibrary\steamapps\workshop\content\227300
@@ -114,33 +117,33 @@ set ETS2FAST_ROOT=H:\SteamLibrary\steamapps\workshop\content\227300
 
 ---
 
-## Project layout
+## 项目结构
 
-This repository contains sources only. Ready-to-run builds are on the [Releases](../../releases) page.
+本仓库只包含源码。可直接运行的成品请到 [Releases](../../releases) 下载。
 
 ```
 ets2fast/
 ├── src/
-│   ├── main.cpp       DLL injected into the game: path index + NtCreateFile hook
-│   ├── launcher.cpp   daemon / %command% wrapper / one-shot injector
-│   └── setup.cpp      CMD menu: toggles auto-inject, manages the autostart entry
+│   ├── main.cpp       注入进游戏的 DLL：路径索引 + NtCreateFile hook
+│   ├── launcher.cpp   守护进程 / 包装器 / 手动注入器（一份源码编出两个 exe）
+│   └── setup.cpp      CMD 菜单：开关自动注入、管理开机自启
 ├── tools/
-│   └── logtime.py     load-time breakdown (run after quitting the game)
-├── README.md          English (this file)
-├── README.zh-CN.md    简体中文
+│   └── logtime.py     读档耗时分析（跑完游戏后运行）
+├── README.md          简体中文（本文件）
+├── README.en.md       English
 └── LICENSE
 ```
 
 ---
 
-## Logs and diagnostics
+## 日志与诊断
 
-| File | Contents |
+| 文件 | 内容 |
 |---|---|
-| `ets2fast.log` | Written by the DLL: which workshop root was picked, index size, whether the hook installed, a `blocked/passed` counter every 60 s |
-| `ets2fast-launcher.log` | Written by the daemon / injector: process found, injection result, exit code |
+| `ets2fast.log` | DLL 写的：选了哪个 workshop 目录、索引条数、hook 是否装上、每 60 秒一行 `blocked/passed` 计数 |
+| `ets2fast-launcher.log` | 守护进程 / 注入器写的：发现游戏、注入结果、退出码 |
 
-A healthy log looks like this:
+正常的日志长这样：
 
 ```
 === ets2fast attach ===
@@ -152,11 +155,11 @@ hook installed
 stats: blocked=1804170 passed=4572 index=16225
 ```
 
-`blocked` climbing fast while `passed` stays flat means the interception is working.
+`blocked` 迅速增长、`passed` 基本不动，说明拦截在生效。
 
-If you see `root: NOT FOUND - no hook installed`, or `blocked` stays at 0, the hook did not take — please open an issue with both logs attached.
+看到 `root: NOT FOUND - no hook installed` 或 `blocked=0`，说明挂钩没成功，请附上日志提 issue。
 
-Debug mode (dumps the first 300 blocked paths):
+调试模式（记录前 300 条被拦路径）：
 
 ```cmd
 set ETS2FAST_DEBUG=1
@@ -164,55 +167,55 @@ set ETS2FAST_DEBUG=1
 
 ---
 
-## Safety
+## 安全性设计
 
-* Only paths that are **provably absent** are refused: every level starting from the mod id must exist in the index. An unrecognised level always falls through. An incomplete index cannot cause false negatives.
-* Error codes match Windows exactly: a missing leaf returns `2`, a missing parent returns `3`. Any game logic that branches on the error code sees the same values as without the hook.
-* Any request with write access is always passed through.
-* If the index is empty or scanning fails, **the hook is not installed at all** — behaviour is identical to vanilla.
-* Directory watching: subscribing or unsubscribing mods while the game runs (Steam downloads, then "Confirm changes" triggers a hot reload) is detected — interception stops immediately, waits for a few seconds of quiet, rebuilds the index and resumes. No game restart needed.
-* A failed injection never breaks the game. Worst case: no speedup.
-* The daemon writes only its own logs and one `HKEY_CURRENT_USER` autostart value. It does not touch system directories, the game folder, or any mod.
+* 只拦**能证明不存在**的路径：从 mod id 开始逐级必须存在，遇到不认识的层级一律放行。索引不完整也不会误伤。
+* 返回的错误码与系统原生一致：末级文件缺失返回 `2`，中间目录缺失返回 `3`。游戏内部按错误码分支的逻辑不会改变走向。
+* 任何带写权限的打开请求一律放行。
+* 索引为空或扫描失败时**根本不安装 hook**，游戏行为等同原版。
+* 目录监听：游戏运行中订阅/取消 mod（Steam 下载后点「确认更改」热重载）会被检测到——立即停止拦截、等几秒静默、重建索引、自动恢复，不需要重启游戏。
+* 注入失败不会影响游戏：最坏情况就是没有加速，游戏照常运行。
+* 守护进程只写自己的日志和 `HKEY_CURRENT_USER` 里那一个开机自启项，不碰系统目录、不碰游戏目录、不碰任何 mod。
 
 ---
 
-## Compatibility
+## 兼容性
 
-Tested with these third-party components present in `bin\win_x64`:
+游戏 `bin\win_x64` 目录里同时存在这些第三方组件时已实测无冲突：
 
-| File | What it is | Hooks file APIs? |
+| 文件 | 身份 | 是否 hook 文件 API |
 |---|---|---|
-| `dxgi.dll` | ReShade 6.8.0 | No (graphics / input only) |
-| `steam_api64.dll` | cream_api 5.1.0 | No (Steam API proxy) |
-| `version.dll` | Juij loader | No |
-| `winmm.dll` | Juij loader | No |
-| `dstorage.dll` | SCS DirectStorage | No |
+| `dxgi.dll` | ReShade 6.8.0 | 否（hook 图形/输入） |
+| `steam_api64.dll` | cream_api 5.1.0 | 否（只代理 Steam API） |
+| `version.dll` | Juij 加载器 | 否 |
+| `winmm.dll` | Juij 加载器 | 否 |
+| `dstorage.dll` | SCS 官方 DirectStorage | 否 |
 
-**Hook chaining** was verified as well: if another tool hooked `NtCreateFile` first, this DLL reads the current jump target as the "original implementation" and calls through it, so both hooks fire and neither is overwritten. In the reverse order the worst case is that this tool stops working — no errors, no crashes.
-
----
-
-## Known limitations
-
-* **Absolute paths only.** The game currently uses nothing else. If a relative path ever appears, that lookup simply goes unaccelerated — correctness is unaffected.
-* **`NtCreateFile` only.** If SCS ever routes mod reads through DirectStorage (currently used for official `.scs` only), interception stops applying — the speedup shrinks, nothing breaks.
-* Windows feature updates can change how `ntdll` exports look. Both the Win11 thunk form (`48 B8 <imm64> FF E0`) and the classic syscall stub (`4C 8B D1 B8 ...`) are supported and were tested successfully.
-* The daemon stays resident using about 9 MB of RAM and polls the process list every 250 ms.
+**链式 hook** 也验证过：若别的工具先 hook 了 `NtCreateFile`，本工具会读取当时的跳转目标作为「原始实现」，接在它之上调用，两个钩子都会触发，不会互相覆盖。反向（别人在本工具之后再 hook）最坏只是本工具失效，不会报错。
 
 ---
 
-## Tested on
+## 已知限制
 
-| | |
+* 只处理**绝对路径**。游戏目前全是绝对路径；若将来某处用相对路径，那部分只是不加速，不影响正确性。
+* 只 hook `NtCreateFile`。若游戏改用 DirectStorage 读 mod（目前仅用于官方 `.scs`），拦截会失效——表现为加速变小，不会出错。
+* Windows 大版本更新可能改变 `ntdll` 导出形式。代码同时支持 Win11 的 thunk 形式（`48 B8 <imm64> FF E0`）和传统 syscall stub 形式（`4C 8B D1 B8 ...`），两种都实测装成功。
+* 守护进程常驻，内存占用约 9 MB，每 250 ms 查一次进程列表。
+
+---
+
+## 实测环境
+
+| 项 | 配置 |
 |---|---|
-| OS | Windows 11 Pro, build 26300 |
-| Game | Euro Truck Simulator 2 1.62.3.2s (Steam) |
-| Mods | 58 workshop subscriptions |
-| Hardware | Ryzen 7 3700X / RTX 3070 / 16 GB |
-| Storage | Colorful CN600 1 TB PRO (PCIe 3.0, DRAM-less) |
+| 系统 | Windows 11 专业版 Build 26300 |
+| 游戏 | Euro Truck Simulator 2 1.62.3.2s（Steam） |
+| mod | 58 个创意工坊订阅 |
+| 硬件 | Ryzen 7 3700X / RTX 3070 / 16 GB |
+| 磁盘 | Colorful CN600 1TB PRO（PCIe 3.0 无缓存） |
 
 ---
 
-## License
+## 许可
 
 [MIT](LICENSE)
