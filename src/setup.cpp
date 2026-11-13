@@ -9,6 +9,7 @@
 // so it works the same on any Windows machine without elevation.
 
 #include <windows.h>
+#include <shellapi.h>
 #include <tlhelp32.h>
 #include <stdio.h>
 #include <string>
@@ -20,6 +21,11 @@
 #define DLL_NAME   L"ets2fast.dll"
 
 static std::wstring g_dir;
+
+// self-healing state, shared with the action handlers further down
+static bool  g_healChecked = false;
+static bool  g_healDone    = false;
+static DWORD g_healPid     = 0;
 
 // ---------------- console output ----------------
 static HANDLE g_out = INVALID_HANDLE_VALUE;
@@ -74,20 +80,69 @@ static void pause_enter()
 }
 
 // ---------------- process helpers ----------------
+// A single toolhelp snapshot can come back short on a busy system, which would
+// make a perfectly healthy daemon look dead. Retry before believing "not running".
 static DWORD find_proc(const wchar_t* name)
 {
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE) return 0;
-    PROCESSENTRY32W pe;
-    pe.dwSize = sizeof(pe);
-    DWORD pid = 0;
-    if (Process32FirstW(snap, &pe)) {
-        do {
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap == INVALID_HANDLE_VALUE) {
+            Sleep(30);
+            continue;
+        }
+
+        PROCESSENTRY32W pe;
+        pe.dwSize = sizeof(pe);
+        DWORD pid = 0;
+        BOOL ok = Process32FirstW(snap, &pe);
+        while (ok) {
             if (_wcsicmp(pe.szExeFile, name) == 0) { pid = pe.th32ProcessID; break; }
-        } while (Process32NextW(snap, &pe));
+            ok = Process32NextW(snap, &pe);
+        }
+        CloseHandle(snap);
+
+        if (pid) return pid;
+
+        // the walk ended for a reason other than "no more entries" -> unreliable
+        if (ok == FALSE && GetLastError() != ERROR_NO_MORE_FILES) {
+            Sleep(30);
+            continue;
+        }
+        return 0;                   // walked everything, genuinely not running
     }
-    CloseHandle(snap);
-    return pid;
+    return 0;
+}
+
+static ULONGLONG filetime_now()
+{
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER li;
+    li.LowPart  = ft.dwLowDateTime;
+    li.HighPart = ft.dwHighDateTime;
+    return li.QuadPart;
+}
+
+// seconds the process has been alive, 0 if it cannot be queried
+static ULONGLONG proc_uptime_seconds(DWORD pid)
+{
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return 0;
+
+    FILETIME created, exited, kernel, user;
+    ULONGLONG started = 0;
+    if (GetProcessTimes(h, &created, &exited, &kernel, &user)) {
+        ULARGE_INTEGER li;
+        li.LowPart  = created.dwLowDateTime;
+        li.HighPart = created.dwHighDateTime;
+        started = li.QuadPart;
+    }
+    CloseHandle(h);
+
+    if (!started) return 0;
+    ULONGLONG now = filetime_now();
+    if (now <= started) return 0;
+    return (now - started) / 10000000ULL;
 }
 
 static bool exists(const std::wstring& p)
@@ -143,36 +198,50 @@ static bool start_daemon()
     if (!exists(exe)) return false;
     if (find_proc(DAEMON_EXE)) return true;
 
-    std::wstring cmd = L"\"" + exe + L"\"";
-    std::vector<wchar_t> buf(cmd.begin(), cmd.end());
-    buf.push_back(0);
+    // Go through the shell first. The replacement is then created by explorer,
+    // which does not belong to whatever job this program may be running in.
+    // A job with KILL_ON_JOB_CLOSE is exactly what makes background processes
+    // disappear silently when their starter exits.
+    SHELLEXECUTEINFOW sei;
+    ZeroMemory(&sei, sizeof(sei));
+    sei.cbSize      = sizeof(sei);
+    sei.fMask       = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
+    sei.lpVerb      = L"open";
+    sei.lpFile      = exe.c_str();
+    sei.lpDirectory = g_dir.c_str();
+    sei.nShow       = SW_HIDE;
 
-    STARTUPINFOW si;
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    ZeroMemory(&pi, sizeof(pi));
+    if (ShellExecuteExW(&sei) && sei.hProcess) {
+        CloseHandle(sei.hProcess);
+    } else {
+        std::wstring cmd = L"\"" + exe + L"\"";
+        std::vector<wchar_t> buf(cmd.begin(), cmd.end());
+        buf.push_back(0);
 
-    // Detach from whatever job this process belongs to (shells and launchers
-    // often wrap children in one and kill them on exit). A background daemon
-    // has to outlive the menu that started it.
-    DWORD flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB;
-    BOOL started = CreateProcessW(exe.c_str(), buf.data(), nullptr, nullptr, FALSE,
-                                  flags, nullptr, g_dir.c_str(), &si, &pi);
-    if (!started) {
-        flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
-        started = CreateProcessW(exe.c_str(), buf.data(), nullptr, nullptr, FALSE,
-                                 flags, nullptr, g_dir.c_str(), &si, &pi);
+        STARTUPINFOW si;
+        PROCESS_INFORMATION pi;
+        ZeroMemory(&si, sizeof(si));
+        si.cb = sizeof(si);
+        ZeroMemory(&pi, sizeof(pi));
+
+        DWORD flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB;
+        BOOL started = CreateProcessW(exe.c_str(), buf.data(), nullptr, nullptr, FALSE,
+                                      flags, nullptr, g_dir.c_str(), &si, &pi);
+        if (!started) {
+            flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+            started = CreateProcessW(exe.c_str(), buf.data(), nullptr, nullptr, FALSE,
+                                     flags, nullptr, g_dir.c_str(), &si, &pi);
+        }
+        if (!started) return false;
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
     }
-    if (!started) return false;
 
     // give it a moment to come up, so the caller can report the truth
     for (int i = 0; i < 40; ++i) {
         if (find_proc(DAEMON_EXE)) break;
         Sleep(50);
     }
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
     return find_proc(DAEMON_EXE) != 0;
 }
 
@@ -285,10 +354,11 @@ static bool steam_launchopt_has_ets2fast()
 // ---------------- status ----------------
 static void print_status()
 {
-    bool daemonUp  = find_proc(DAEMON_EXE) != 0;
-    std::wstring v = autostart_read();
-    bool autostartSet = (v.find(L"ets2fast") != std::wstring::npos ||
-                         v.find(L"Ets2Fast") != std::wstring::npos);
+    DWORD daemonPid   = find_proc(DAEMON_EXE);
+    bool  daemonUp    = daemonPid != 0;
+    std::wstring v    = autostart_read();
+    bool  autostartSet = (v.find(L"ets2fast") != std::wstring::npos ||
+                          v.find(L"Ets2Fast") != std::wstring::npos);
 
     out(L"  ");
     color(8);
@@ -299,17 +369,39 @@ static void print_status()
         color(10);
         outln(L"已开启");
         reset_color();
-        outln(L"            后台守护正在运行，开机自动启动");
+
+        // the uptime tells you whether the daemon has been restarted since
+        // you last looked, which is exactly what matters when it "disappears"
+        ULONGLONG up = proc_uptime_seconds(daemonPid);
+        wchar_t line[200];
+        if (up >= 3600)
+            _snwprintf(line, 200, L"            后台守护 PID %lu，已运行 %llu 小时 %llu 分，开机自动启动",
+                       daemonPid, up / 3600, (up % 3600) / 60);
+        else if (up >= 60)
+            _snwprintf(line, 200, L"            后台守护 PID %lu，已运行 %llu 分 %llu 秒，开机自动启动",
+                       daemonPid, up / 60, up % 60);
+        else if (up > 0)
+            _snwprintf(line, 200, L"            后台守护 PID %lu，刚启动 %llu 秒，开机自动启动",
+                       daemonPid, up);
+        else
+            _snwprintf(line, 200, L"            后台守护 PID %lu，刚刚启动，开机自动启动", daemonPid);
+        line[199] = 0;
+        outln(line);
     } else if (daemonUp && !autostartSet) {
         color(14);
         outln(L"部分开启（守护在跑，但没有开机自启）");
         reset_color();
+        out(L"            后台守护 PID ");
+        wchar_t pidbuf[32];
+        _snwprintf(pidbuf, 32, L"%lu", daemonPid);
+        pidbuf[31] = 0;
+        outln(pidbuf);
         outln(L"            按 1 补上开机自启");
     } else if (!daemonUp && autostartSet) {
-        color(14);
-        outln(L"已配置但守护未运行");
+        color(12);
+        outln(L"异常：已配置开机自启，但后台守护没有运行");
         reset_color();
-        outln(L"            按 1 重新拉起");
+        outln(L"            按 1 重新拉起，或直接双击 " DAEMON_EXE);
     } else {
         color(7);
         outln(L"未开启（手动方式）");
@@ -392,6 +484,7 @@ static void show_log()
 // ---------------- actions ----------------
 static void do_enable()
 {
+    g_healDone = false;          // the notice is stale once the user acts
     out(L"\n");
 
     if (!exists(g_dir + DLL_NAME)) {
@@ -455,6 +548,7 @@ static void do_enable()
 
 static void do_disable()
 {
+    g_healDone = false;
     out(L"\n");
 
     bool regOk = autostart_remove();
@@ -518,6 +612,29 @@ static int forward_launch()
     return (int)code;
 }
 
+// ---------------- self healing ----------------
+// Auto inject is configured, but the daemon is gone. That can happen for
+// reasons outside our control: a job object closing, a "cleanup" utility,
+// Task Manager, a crash. Nothing is watching it, so we do it here: every time
+// the menu opens, a missing daemon gets started again.
+static void self_heal()
+{
+    if (g_healChecked) return;
+    g_healChecked = true;
+
+    std::wstring v = autostart_read();
+    bool configured = (v.find(L"ets2fast") != std::wstring::npos ||
+                       v.find(L"Ets2Fast") != std::wstring::npos);
+    if (!configured) return;            // auto inject is off on purpose
+
+    if (find_proc(DAEMON_EXE)) return;  // healthy
+
+    if (start_daemon()) {
+        g_healDone = true;
+        g_healPid  = find_proc(DAEMON_EXE);
+    }
+}
+
 static void draw_menu()
 {
     out(L"\n");
@@ -529,6 +646,17 @@ static void draw_menu()
     color(11);
     out(L"  ==========================================================\n");
     reset_color();
+
+    if (g_healDone) {
+        wchar_t line[160];
+        _snwprintf(line, 160, L"  * 后台守护之前已停止，已自动重新启动（PID %lu）", g_healPid);
+        line[159] = 0;
+        color(10);
+        outln(line);
+        reset_color();
+        outln(L"    日志里最后一条 daemon: 记录能看出它是什么时候停的");
+        out(L"\n");
+    }
 
     print_status();
 
@@ -577,6 +705,10 @@ int wmain()
     if (GetConsoleScreenBufferInfo(g_out, &csbi)) g_attr = csbi.wAttributes;
 
     SetConsoleTitleW(L"ETS2 载入加速 - 设置");
+
+    // before the first screen: if auto inject is on but the daemon is missing,
+    // start it again rather than only telling the user something is wrong
+    self_heal();
 
     for (;;) {
         draw_menu();

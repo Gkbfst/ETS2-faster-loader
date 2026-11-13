@@ -90,6 +90,10 @@ ETS2 的虚拟文件系统没有资源索引。它的做法是：来一个资源
 
 守护进程每 250 ms 检查一次 `eurotrucks2.exe` 是否存在，发现即注入 `ets2fast.dll`，然后继续等下一次启动。
 
+它还会在被启动时记下自己的 PID 和是否处于 job 对象中（`inJob`），每 5 分钟写一行心跳。万一它被系统或清理工具悄悄杀掉，日志里能看出准确的停止时刻。
+
+另外，**每次打开 `ets2fast.exe` 都会检查一遍守护是否还活着**，不在就自动重新拉起 —— 这是守护被意外终止时的兜底。
+
 **为什么不用 `%command%` 包装 Steam 启动选项：**
 
 | | 包装启动选项 | 后台守护 |
@@ -164,6 +168,44 @@ stats: blocked=1804170 passed=4572 index=16225
 ```cmd
 set ETS2FAST_DEBUG=1
 ```
+
+### 守护进程的日志
+
+`ets2fast-launcher.log` 里，一次正常的开启长这样：
+
+```
+daemon: started pid=16152 inJob=0
+daemon: injected into pid 21280
+daemon: hook is live
+daemon: game closed, ready for the next launch
+daemon: alive, uptime 300 s
+```
+
+**每 5 分钟会有一行 `alive, uptime N s`。** 所以如果守护哪天不见了，
+日志最后一行的时间戳就是它停止的时刻，不用猜。
+
+`inJob` 这个字段值得留意：
+
+| 值 | 含义 |
+|---|---|
+| `inJob=0` | 守护是独立进程，正常 |
+| `inJob=1` | 它继承了一个 job 对象。如果那个 job 在父进程退出时关闭，Windows 会**静默杀掉**守护，一行日志都不会留 |
+
+出现 `inJob=1` 时程序会先尝试经资源管理器重新启动一次来脱离（日志里会写
+`relaunched through the shell`）。如果重启后仍是 `inJob=1`，说明你的系统里
+存在全局的 job 限制，这时候就依赖下面的自动恢复。
+
+### 守护不见了怎么办
+
+打开 `ets2fast.exe` 就行。程序启动时会先检查一遍，发现「已配置开机自启、
+但守护没在运行」会自动把它拉起来，并在顶部提示：
+
+```
+  * 后台守护之前已停止，已自动重新启动（PID 10744）
+```
+
+状态行也会显示守护的 PID 和已运行时长。时长显示「刚刚启动」说明它被重启过，
+显示「已运行 3 小时」说明一直好好的。
 
 ---
 

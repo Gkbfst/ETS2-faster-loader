@@ -87,6 +87,10 @@ Pressing `1` does two things:
 
 The daemon polls for `eurotrucks2.exe` every 250 ms, injects `ets2fast.dll` as soon as the process appears, then goes back to waiting for the next launch.
 
+It also records its own PID and whether it landed inside a job object (`inJob`), and writes a heartbeat every 5 minutes. If it ever gets killed silently, the log shows the exact moment it stopped.
+
+On top of that, **every time `ets2fast.exe` opens it checks whether the daemon is still alive** and starts it again if not — the safety net for a daemon killed by anything outside our control.
+
 **Why a daemon instead of wrapping Steam's launch options with `%command%`:**
 
 | | Wrapper via launch options | Background daemon |
@@ -161,6 +165,47 @@ Debug mode (dumps the first 300 blocked paths):
 ```cmd
 set ETS2FAST_DEBUG=1
 ```
+
+### Daemon log
+
+A healthy session in `ets2fast-launcher.log`:
+
+```
+daemon: started pid=16152 inJob=0
+daemon: injected into pid 21280
+daemon: hook is live
+daemon: game closed, ready for the next launch
+daemon: alive, uptime 300 s
+```
+
+**There is an `alive, uptime N s` line every 5 minutes.** If the daemon ever
+goes missing, the timestamp of the last line tells you exactly when it stopped —
+no guessing.
+
+The `inJob` field is worth watching:
+
+| Value | Meaning |
+|---|---|
+| `inJob=0` | Independent process, as intended |
+| `inJob=1` | It inherited a job object. If that job closes when its owner exits, Windows **kills the daemon silently** — not a single line in the log |
+
+When `inJob=1` shows up, the program first tries to relaunch itself through the
+shell to escape (the log says `relaunched through the shell`). If it is still
+`inJob=1` afterwards, your system has a global job restriction and the recovery
+below is what keeps things working.
+
+### If the daemon disappears
+
+Just open `ets2fast.exe`. On startup it checks whether auto inject is configured
+while the daemon is missing, and starts it again, with a notice at the top:
+
+```
+  * 后台守护之前已停止，已自动重新启动（PID 10744）
+  (daemon had stopped, restarted automatically)
+```
+
+The status line also shows the daemon's PID and uptime. "刚刚启动" (just
+started) means it was restarted; a long uptime means it has been fine all along.
 
 ---
 

@@ -6,6 +6,7 @@
 // folder by itself, so nothing here is machine specific.
 
 #include <windows.h>
+#include <shellapi.h>
 #include <tlhelp32.h>
 #include <stdio.h>
 #include <string>
@@ -285,8 +286,21 @@ static int watch_mode()
 #define ETS2FAST_MUTEX L"Local\\ets2fast_daemon_mutex"
 #define ETS2FAST_STOP  L"Local\\ets2fast_daemon_stop"
 
+// If the daemon dies from an exception, leave a line behind before Windows
+// takes the process down. Without this a crash looks exactly like a silent
+// disappearance, which is impossible to debug after the fact.
+static LONG WINAPI daemon_crash_filter(EXCEPTION_POINTERS* ep)
+{
+    DWORD code = (ep && ep->ExceptionRecord) ? ep->ExceptionRecord->ExceptionCode : 0;
+    void* addr = (ep && ep->ExceptionRecord) ? ep->ExceptionRecord->ExceptionAddress : nullptr;
+    say(L"daemon: CRASH code=0x%08lX at %p", code, addr);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 static int daemon_mode()
 {
+    SetUnhandledExceptionFilter(daemon_crash_filter);
+
     // one daemon per session; a second copy just leaves
     HANDLE single = CreateMutexW(nullptr, FALSE, ETS2FAST_MUTEX);
     if (single && GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -310,16 +324,93 @@ static int daemon_mode()
         return 2;
     }
 
-    say(L"daemon: started, watching for eurotrucks2.exe");
+    // A job object with KILL_ON_JOB_CLOSE makes a background process vanish
+    // silently the moment whatever started it exits. Record the fact, and try
+    // once to relaunch outside the job so the daemon survives its parent.
+    BOOL inJob = FALSE;
+    IsProcessInJob(GetCurrentProcess(), nullptr, &inJob);
+
+    ULONGLONG started = GetTickCount64();
+    say(L"daemon: started pid=%lu inJob=%d", GetCurrentProcessId(), inJob ? 1 : 0);
+
+    if (inJob) {
+        wchar_t flag[8] = {0};
+        bool alreadyTried = GetEnvironmentVariableW(L"ETS2FAST_RELAUNCHED", flag, 8) > 0;
+
+        if (!alreadyTried) {
+            wchar_t self[MAX_PATH * 2];
+            GetModuleFileNameW(nullptr, self, MAX_PATH * 2);
+
+            // release the name first, otherwise the replacement sees it taken
+            if (single) { CloseHandle(single); single = nullptr; }
+            SetEnvironmentVariableW(L"ETS2FAST_RELAUNCHED", L"1");
+
+            // Going through the shell is the reliable way out: the replacement
+            // is created by explorer, which is not a member of our job, so it
+            // survives when whatever started us goes away.
+            SHELLEXECUTEINFOW sei;
+            ZeroMemory(&sei, sizeof(sei));
+            sei.cbSize       = sizeof(sei);
+            sei.fMask        = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
+            sei.lpVerb       = L"open";
+            sei.lpFile       = self;
+            sei.lpParameters = L"--daemon";
+            sei.lpDirectory  = g_dir.c_str();
+            sei.nShow        = SW_HIDE;
+
+            if (ShellExecuteExW(&sei) && sei.hProcess) {
+                say(L"daemon: relaunched through the shell as pid %lu, this copy exits",
+                    GetProcessId(sei.hProcess));
+                CloseHandle(sei.hProcess);
+                if (stop) CloseHandle(stop);
+                return 0;
+            }
+            say(L"daemon: shell relaunch failed (%lu), falling back to CreateProcess", GetLastError());
+
+            std::wstring cmd = L"\"" + std::wstring(self) + L"\" --daemon";
+            std::vector<wchar_t> relaunchBuf(cmd.begin(), cmd.end());
+            relaunchBuf.push_back(0);
+
+            STARTUPINFOW si;
+            PROCESS_INFORMATION pi;
+            ZeroMemory(&si, sizeof(si));
+            si.cb = sizeof(si);
+            ZeroMemory(&pi, sizeof(pi));
+
+            BOOL ok = CreateProcessW(self, relaunchBuf.data(), nullptr, nullptr, FALSE,
+                                     DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB,
+                                     nullptr, g_dir.c_str(), &si, &pi);
+            if (ok) {
+                say(L"daemon: relaunched outside the job as pid %lu, this copy exits", pi.dwProcessId);
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+                if (stop) CloseHandle(stop);
+                return 0;
+            }
+
+            say(L"daemon: relaunch failed (%lu), staying inside the job", GetLastError());
+            single = CreateMutexW(nullptr, FALSE, ETS2FAST_MUTEX);   // restore the guard
+        } else {
+            say(L"daemon: still inside a job after relaunch, continuing anyway");
+        }
+    }
 
     DWORD injectedPid = 0;
     int   attempts    = 0;
+    int   ticks       = 0;
 
     for (;;) {
         DWORD w = stop ? WaitForSingleObject(stop, 250) : (Sleep(250), WAIT_TIMEOUT);
         if (w == WAIT_OBJECT_0) {
-            say(L"daemon: stop requested, exiting");
+            say(L"daemon: stop requested, exiting after %llu s",
+                (GetTickCount64() - started) / 1000);
             break;
+        }
+
+        // heartbeat every 5 minutes: a gap in the log tells us when it died
+        if (++ticks >= 1200) {
+            ticks = 0;
+            say(L"daemon: alive, uptime %llu s", (GetTickCount64() - started) / 1000);
         }
 
         DWORD pid = find_proc(L"eurotrucks2.exe");
