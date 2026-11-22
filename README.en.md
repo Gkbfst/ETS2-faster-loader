@@ -51,7 +51,7 @@ What this tool does is keep a workshop path table inside the game process and an
 
 ### 1. Download
 
-Grab `ets2fast-v1.0.0-win64.zip` from [Releases](../../releases) and extract it anywhere.
+Grab `ets2fast-*-win64.zip` (whatever the latest version is) from [Releases](../../releases/latest) and extract it anywhere.
 
 ### 2. Enable
 
