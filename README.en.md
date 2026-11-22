@@ -85,7 +85,7 @@ Pressing `1` does two things:
 1. Starts `ets2fastd.exe`, a windowless background daemon
 2. Registers it under `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`
 
-The daemon polls for `eurotrucks2.exe` every 250 ms, injects `ets2fast.dll` as soon as the process appears, then goes back to waiting for the next launch.
+The daemon polls for `eurotrucks2.exe` every 250 ms. Finding it is not enough to inject: it waits until the game has created its first visible top-level window (30 s cap) and only then attaches. The next section explains why.
 
 It also records its own PID and whether it landed inside a job object (`inJob`), and writes a heartbeat every 5 minutes. If it ever gets killed silently, the log shows the exact moment it stopped.
 
@@ -101,6 +101,44 @@ On top of that, **every time `ets2fast.exe` opens it checks whether the daemon i
 | Requires administrator | Depends on install location | **No, no UAC prompt** |
 
 > Compatibility note: if you used the old `--launch` wrapper, `ets2fast.exe` still understands it — it forwards the call to `ets2fastd.exe` and passes the exit code back, so Steam keeps tracking the game correctly. The menu also checks for a leftover wrapper entry when you press `1` and warns you.
+
+---
+
+## Injection timing and high-DPI displays
+
+**If your display scaling is anything other than 100%, this section is for you.**
+
+Earlier builds injected the moment `eurotrucks2.exe` showed up in the process list. That made the game lose its DPI awareness: on a 125% / 150% display it treats physical pixels as logical ones, Windows then enlarges the window by the scaling factor, and the picture ends up larger than the screen with all four edges cropped.
+
+Measured on 2560×1600 @ 125%:
+
+| Condition | Window | Window DPI |
+|---|---|---|
+| No injection | 2560×1600 @ (0,0) | 120 |
+| Old build, injected | **3200×2000 @ (−320,−200)** | **96** |
+
+`3200 = 2560 × 1.25`, exactly the scaling factor.
+
+**The fix**: wait for the main window before attaching. The DPI context is decided when the first window is created, so injecting afterwards no longer touches it.
+
+There is also a fallback inside the DLL that explicitly asks for a per-monitor v2 context. It takes effect when the process has not locked one yet:
+
+```
+dpi: context set to per-monitor v2
+dpi: context already locked (err=5), left unchanged
+```
+
+The second line is the normal case — the game has already declared its own.
+
+**Why the delay costs nothing**: the expensive part of loading is mod enumeration and resource probing, which happens after the main window appears and runs for tens of seconds. The log proves it:
+
+```
+hook installed
+stats: blocked=0            <- 60 s in, not a single probe yet
+stats: blocked=1,547,456    <- the burst happens by 120 s
+```
+
+Still zero at 60 s means the game had not reached mod enumeration. Waiting 3–9 s for the window is comfortably early.
 
 ---
 

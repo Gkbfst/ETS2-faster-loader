@@ -535,11 +535,29 @@ static DWORD WINAPI watch_thread(LPVOID)
 }
 
 // ---------------- init ----------------
+// Falling back: if injection still beat the game's own initialisation, the
+// process may be treated as DPI unaware, which breaks >100% scaling. Ask for
+// per-monitor v2 - it fails harmlessly once a window already locked the mode.
+static void try_restore_dpi()
+{
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (!user32) return;
+
+    typedef BOOL (WINAPI* PFN_SET_CTX)(void*);
+    PFN_SET_CTX fn = (PFN_SET_CTX)(void*)GetProcAddress(user32, "SetProcessDpiAwarenessContext");
+    if (!fn) return;
+
+    // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 is the pseudo handle (void*)-4
+    if (fn((void*)-4)) logf("dpi: context set to per-monitor v2");
+    else               logf("dpi: context already locked (err=%lu), left unchanged", GetLastError());
+}
+
 static DWORD WINAPI init_thread(LPVOID)
 {
     if (InterlockedCompareExchange(&g_ready, -1, 0) != 0) return 0;   // already running
 
     logf("=== ets2fast attach ===");
+    try_restore_dpi();
     {
         wchar_t dbg[8] = {0};
         if (GetEnvironmentVariableW(L"ETS2FAST_DEBUG", dbg, 8) > 0) g_debug = _wtoi(dbg);

@@ -135,6 +135,69 @@ static bool inject_once(DWORD pid, const std::wstring& dll)
 }
 
 // try until the deadline; the target may still be starting up
+// ---------------- DPI-safe injection timing ----------------
+// Injecting the moment eurotrucks2.exe appears lets us beat the game's own
+// initialisation: on a display scaled above 100% the process ends up treated
+// as DPI unaware, so Windows enlarges the borderless window and the picture
+// bleeds past every screen edge. Waiting for the first real top-level window
+// costs nothing - mod enumeration starts later and runs for tens of seconds.
+struct WindowProbe
+{
+    DWORD pid;
+    HWND  hit;
+};
+
+static BOOL CALLBACK probe_window(HWND h, LPARAM param)
+{
+    WindowProbe* p = (WindowProbe*)param;
+
+    DWORD owner = 0;
+    GetWindowThreadProcessId(h, &owner);
+    if (owner != p->pid) return TRUE;
+
+    if (!IsWindowVisible(h)) return TRUE;
+    if (GetWindow(h, GW_OWNER) != nullptr) return TRUE;   // dialogs, tooltips
+
+    // ignore splash/logo windows, the real one is at least a few hundred px
+    RECT r;
+    if (!GetWindowRect(h, &r)) return TRUE;
+    if (r.right - r.left < 200 || r.bottom - r.top < 200) return TRUE;
+
+    p->hit = h;
+    return FALSE;                                          // stop enumerating
+}
+
+static HWND find_main_window(DWORD pid)
+{
+    WindowProbe p = { pid, nullptr };
+    EnumWindows(probe_window, (LPARAM)&p);
+    return p.hit;
+}
+
+static void wait_for_main_window(DWORD pid, DWORD timeoutMs, HANDLE stopEvent = nullptr)
+{
+    HANDLE proc = OpenProcess(SYNCHRONIZE, FALSE, pid);
+    DWORD  t0   = GetTickCount();
+    bool   gone = false;
+
+    for (;;) {
+        if (find_main_window(pid)) {
+            say(L"main window is up, injecting now");
+            break;
+        }
+        if (GetTickCount() - t0 >= timeoutMs) {
+            say(L"no main window after %lu ms, injecting anyway", timeoutMs);
+            break;
+        }
+        if (stopEvent && WaitForSingleObject(stopEvent, 0) == WAIT_OBJECT_0) break;
+        if (proc && WaitForSingleObject(proc, 0) == WAIT_OBJECT_0) { gone = true; break; }
+        Sleep(100);
+    }
+
+    if (proc) CloseHandle(proc);
+    if (gone) say(L"game exited before the window appeared");
+}
+
 static bool inject_retry(DWORD pid, const std::wstring& dll, int seconds)
 {
     for (int i = 0; i < seconds * 8; ++i) {
@@ -223,6 +286,8 @@ static int launch_mode(const std::wstring& gameExe, const std::wstring& gameArgs
 
     std::wstring dll = g_dir + L"ets2fast.dll";
     std::wstring dllLog = g_dir + L"ets2fast.log";
+    wait_for_main_window(pi.dwProcessId, 30000);
+
     long long mark = file_size(dllLog);
     bool ok = inject_retry(pi.dwProcessId, dll, 10);
 
@@ -261,7 +326,9 @@ static int watch_mode()
         return 2;
     }
 
-    say(L"found eurotrucks2.exe (pid %lu), injecting...", pid);
+    say(L"found eurotrucks2.exe (pid %lu), waiting for its main window...", pid);
+    wait_for_main_window(pid, 30000);
+
     std::wstring dllLog = g_dir + L"ets2fast.log";
     long long mark = file_size(dllLog);
     if (!inject_retry(pid, g_dir + L"ets2fast.dll", 10)) {
@@ -425,6 +492,10 @@ static int daemon_mode()
         if (attempts >= 3) continue;              // do not hammer a process that refuses
 
         ++attempts;
+        say(L"daemon: game pid %lu up, waiting for its main window", pid);
+        wait_for_main_window(pid, 30000, stop);
+        if (stop && WaitForSingleObject(stop, 0) == WAIT_OBJECT_0) break;
+
         long long mark = file_size(dllLog);
         if (inject_retry(pid, dll, 6)) {
             injectedPid = pid;
